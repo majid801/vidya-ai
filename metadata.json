@@ -1,0 +1,6 @@
+{
+  "name": "Vidya AI",
+  "description": "AI Personal Teacher & Academic Mentor for Class 1-12 and Intermediate students.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

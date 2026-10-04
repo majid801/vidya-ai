@@ -1,0 +1,261 @@
+package com.example.util
+
+import android.content.Context
+import android.content.Intent
+import android.media.AudioAttributes
+import android.media.MediaPlayer
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.util.Log
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.io.File
+import java.io.FileOutputStream
+import java.util.Locale
+
+class AudioHelper(private val context: Context) : TextToSpeech.OnInitListener {
+
+    private var tts: TextToSpeech? = null
+    var isTtsReady = false
+        private set
+
+    private var mediaPlayer: MediaPlayer? = null
+    private var pendingSpeechText: String? = null
+    private var currentSpeechRate: Float = 1.0f
+
+    private val _isSpeakingFlow = MutableStateFlow(false)
+    val isSpeakingFlow: StateFlow<Boolean> = _isSpeakingFlow.asStateFlow()
+
+    private val _speechRecognitionText = MutableStateFlow<String?>(null)
+    val speechRecognitionText: StateFlow<String?> = _speechRecognitionText.asStateFlow()
+
+    private val _isListening = MutableStateFlow(false)
+    val isListening: StateFlow<Boolean> = _isListening.asStateFlow()
+
+    private var speechRecognizer: SpeechRecognizer? = null
+
+    init {
+        initializeTts()
+    }
+
+    private fun initializeTts() {
+        try {
+            tts = TextToSpeech(context.applicationContext, this)
+        } catch (e: Exception) {
+            Log.e("AudioHelper", "TTS initialization failed", e)
+        }
+    }
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            val t = tts ?: return
+            // Try user's default locale first, then Indian English, then US English
+            var langResult = t.setLanguage(Locale.getDefault())
+            if (langResult == TextToSpeech.LANG_MISSING_DATA || langResult == TextToSpeech.LANG_NOT_SUPPORTED) {
+                langResult = t.setLanguage(Locale("en", "IN"))
+                if (langResult == TextToSpeech.LANG_MISSING_DATA || langResult == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    t.setLanguage(Locale.US)
+                }
+            }
+
+            t.setPitch(1.02f)
+            t.setSpeechRate(currentSpeechRate)
+
+            t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {
+                    _isSpeakingFlow.value = true
+                }
+
+                override fun onDone(utteranceId: String?) {
+                    _isSpeakingFlow.value = false
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun onError(utteranceId: String?) {
+                    _isSpeakingFlow.value = false
+                }
+            })
+
+            isTtsReady = true
+
+            // If a speech request was made while initializing, speak it now!
+            pendingSpeechText?.let { text ->
+                pendingSpeechText = null
+                speakText(text)
+            }
+        } else {
+            Log.e("AudioHelper", "TTS onInit error status: $status")
+        }
+    }
+
+    fun speak(text: String, onComplete: () -> Unit = {}) {
+        speakText(text, onComplete)
+    }
+
+    fun speakText(text: String, onComplete: () -> Unit = {}) {
+        val cleanText = text
+            .replace(Regex("[#*_`~]"), "") // Strip markdown formatting symbols for natural speech
+            .replace(Regex("\\[.*?\\]\\(.*?\\)"), "") // Strip links
+            .trim()
+
+        if (cleanText.isEmpty()) return
+
+        stopAudio()
+
+        if (!isTtsReady) {
+            // Queue pending speech until TTS engine onInit is triggered
+            pendingSpeechText = cleanText
+            return
+        }
+
+        try {
+            val params = Bundle().apply {
+                putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+            }
+            _isSpeakingFlow.value = true
+            tts?.speak(cleanText, TextToSpeech.QUEUE_FLUSH, params, "vidya_utterance_${System.currentTimeMillis()}")
+        } catch (e: Exception) {
+            Log.e("AudioHelper", "Error speaking text", e)
+            _isSpeakingFlow.value = false
+        }
+    }
+
+    fun setSpeechRate(rate: Float) {
+        currentSpeechRate = rate
+        try {
+            tts?.setSpeechRate(rate)
+        } catch (_: Exception) {}
+    }
+
+    fun stop() {
+        stopAudio()
+    }
+
+    fun stopAudio() {
+        try {
+            _isSpeakingFlow.value = false
+            if (mediaPlayer?.isPlaying == true) {
+                mediaPlayer?.stop()
+            }
+            mediaPlayer?.release()
+            mediaPlayer = null
+            tts?.stop()
+        } catch (e: Exception) {
+            Log.e("AudioHelper", "Stop error", e)
+        }
+    }
+
+    /**
+     * Plays raw audio bytes generated by Gemini TTS if available
+     */
+    fun playAudioBytes(audioBytes: ByteArray, onComplete: () -> Unit = {}) {
+        try {
+            stopAudio()
+            val tempFile = File.createTempFile("gemini_tts_", ".mp3", context.cacheDir)
+            FileOutputStream(tempFile).use { it.write(audioBytes) }
+
+            _isSpeakingFlow.value = true
+            mediaPlayer = MediaPlayer().apply {
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                        .build()
+                )
+                setDataSource(tempFile.absolutePath)
+                setOnCompletionListener {
+                    _isSpeakingFlow.value = false
+                    tempFile.delete()
+                    onComplete()
+                }
+                prepare()
+                start()
+            }
+        } catch (e: Exception) {
+            Log.e("AudioHelper", "MediaPlayer error", e)
+            _isSpeakingFlow.value = false
+            onComplete()
+        }
+    }
+
+    /**
+     * Speech-to-Text Voice Input
+     */
+    fun startListening() {
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+            Log.w("AudioHelper", "Speech recognition not available on device")
+            return
+        }
+
+        stopAudio()
+        try {
+            speechRecognizer?.destroy()
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
+                setRecognitionListener(object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) {
+                        _isListening.value = true
+                    }
+                    override fun onBeginningOfSpeech() {}
+                    override fun onRmsChanged(rmsdB: Float) {}
+                    override fun onBufferReceived(buffer: ByteArray?) {}
+                    override fun onEndOfSpeech() {
+                        _isListening.value = false
+                    }
+                    override fun onError(error: Int) {
+                        _isListening.value = false
+                    }
+                    override fun onResults(results: Bundle?) {
+                        _isListening.value = false
+                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        if (!matches.isNullOrEmpty()) {
+                            _speechRecognitionText.value = matches[0]
+                        }
+                    }
+                    override fun onPartialResults(partialResults: Bundle?) {
+                        val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        if (!matches.isNullOrEmpty()) {
+                            _speechRecognitionText.value = matches[0]
+                        }
+                    }
+                    override fun onEvent(eventType: Int, params: Bundle?) {}
+                })
+            }
+
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            }
+            speechRecognizer?.startListening(intent)
+        } catch (e: Exception) {
+            Log.e("AudioHelper", "Start speech recognition error", e)
+            _isListening.value = false
+        }
+    }
+
+    fun stopListening() {
+        try {
+            speechRecognizer?.stopListening()
+            _isListening.value = false
+        } catch (_: Exception) {}
+    }
+
+    fun clearRecognizedText() {
+        _speechRecognitionText.value = null
+    }
+
+    fun release() {
+        stopAudio()
+        try {
+            speechRecognizer?.destroy()
+            speechRecognizer = null
+            tts?.shutdown()
+            tts = null
+        } catch (_: Exception) {}
+    }
+}
